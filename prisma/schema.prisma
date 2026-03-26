@@ -1,0 +1,57 @@
+// Chillion Outreach Hub - Database Schema
+// Only essential models for user authentication and workspace management
+// All prospect/campaign data is managed by the Python backend
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ==================== Authentication ====================
+
+model User {
+  id        String    @id @default(cuid())
+  email     String    @unique
+  password  String
+  name      String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  workspaces      Workspace[] @relation("UserWorkspaces")
+  ownedWorkspaces Workspace[] @relation("WorkspaceOwner")
+  sessions        Session[]
+}
+
+model Session {
+  id          String   @id @default(cuid())
+  userId      String
+  workspaceId String
+  token       String   @unique
+  createdAt   DateTime @default(now())
+  expiresAt   DateTime
+
+  user      User      @relation(fields: [userId], references: [id])
+  workspace Workspace @relation(fields: [workspaceId], references: [id])
+
+  @@index([userId])
+  @@index([workspaceId])
+}
+
+// ==================== Multi-tenancy ====================
+
+model Workspace {
+  id        String   @id @default(cuid())
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  ownerId String
+  owner   User   @relation("WorkspaceOwner", fields: [ownerId], references: [id])
+
+  users    User[]    @relation("UserWorkspaces")
+  sessions Session[]
+}
