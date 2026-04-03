@@ -30,8 +30,13 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
-# env files (can opt-in for committing if needed)
-.env*
+# env files — never commit secrets; .env.example is safe to share
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+!.env.example
 
 # vercel
 .vercel
@@ -61,7 +66,9 @@ next-env.d.ts
 /chillion_agents/chroma_db/
 /chillion_agents/data/
 /chillion_agents/.env
-/chillion_agents/.env.*
+/chillion_agents/.env.local
+/chillion_agents/.env.*.local
+!/chillion_agents/.env.example
 
 # Secrets — never commit
 *.pem
