@@ -311,8 +311,7 @@ export default function SkillsWorkbench() {
                 - Day 12 short breakup message.
               </div>
               <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-4 text-sm text-amber-100">
-                Objection pre-emption: "{objection}" -> acknowledge existing stack, position as layer
-                that increases ROI from current systems.
+                {`Objection pre-emption: "${objection}" -> acknowledge existing stack, position as layer that increases ROI from current systems.`}
               </div>
             </div>
           )}
