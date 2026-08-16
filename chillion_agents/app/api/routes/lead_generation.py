@@ -6,7 +6,7 @@ Integrates social monitoring, company discovery, and contact discovery.
 """
 
 from fastapi import APIRouter, HTTPException, BackgroundTasks, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 import logging
@@ -20,8 +20,8 @@ from app.lead_generation.social.twitter import TwitterScraper
 from app.lead_generation.social.reddit import RedditScraper
 from app.lead_generation.social.forums import ForumScraper
 from app.lead_generation.company.discovery import CompanyDiscoveryService
-from app.lead_generation.contacts.discovery import ContactDiscoveryService
-from app.lead_generation.contacts.email import EmailDiscoveryService, EmailPatternGenerator
+from app.lead_generation.contacts.orchestrator import ContactDiscoveryOrchestrator
+from app.lead_generation.contacts.email import EmailPatternGenerator
 from app.lead_generation.storage.database import LeadDatabase
 from app.lead_generation.config import get_config, set_config
 from app.lead_generation.social.base import BaseSocialScraper
@@ -96,6 +96,56 @@ class ContactSearchRequest(BaseModel):
     company_name: str
     company_domain: Optional[str] = None
     company_website: Optional[str] = None
+    # Omit entirely to fall back to config.company.target_titles (CLI / older callers).
+    # An explicit empty list is invalid and must not be replaced with defaults.
+    target_titles: Optional[List[str]] = None
+    max_results: int = Field(default=10, ge=1, le=50)
+    find_emails: bool = True
+
+    @field_validator("company_name")
+    @classmethod
+    def company_name_must_be_non_blank(cls, value: str) -> str:
+        trimmed = (value or "").strip()
+        if not trimmed:
+            raise ValueError("company_name cannot be blank")
+        return trimmed
+
+    @field_validator("company_domain", "company_website", mode="before")
+    @classmethod
+    def empty_optional_to_none(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        trimmed = str(value).strip()
+        return trimmed or None
+
+    @field_validator("target_titles", mode="before")
+    @classmethod
+    def normalize_target_titles(cls, value):
+        if value is None:
+            return None
+        if not isinstance(value, list):
+            raise ValueError("target_titles must be a list of strings")
+        cleaned: List[str] = []
+        seen = set()
+        for item in value:
+            if item is None:
+                continue
+            title = str(item).strip()
+            if not title:
+                continue
+            key = title.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(title)
+        return cleaned
+
+    @field_validator("target_titles")
+    @classmethod
+    def target_titles_must_not_be_empty_if_provided(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        if value is not None and len(value) == 0:
+            raise ValueError("target_titles must contain at least one meaningful title")
+        return value
 
 
 class ContactSearchResponse(BaseModel):
@@ -104,6 +154,7 @@ class ContactSearchResponse(BaseModel):
     company_name: str
     contacts_found: int
     contacts: List[Dict[str, Any]]
+    warnings: List[str] = Field(default_factory=list)
 
 
 class EmailGenerateRequest(BaseModel):
@@ -340,42 +391,32 @@ async def get_companies(
 @router.post("/contacts/discover", response_model=ContactSearchResponse)
 async def discover_contacts(request: ContactSearchRequest):
     """
-    Discover finance contacts from a company website.
+    Discover contacts for a company using the production pipeline:
+    trusted domain → Prospeo (when available) → employer/title checks →
+    website fallback → email strategy → persist.
     """
     try:
-        company = Company(
-            name=request.company_name,
-            domain=request.company_domain,
-            website=request.company_website
+        orchestrator = ContactDiscoveryOrchestrator(db=db)
+        outcome = orchestrator.discover(
+            company_name=request.company_name,
+            company_domain=request.company_domain,
+            company_website=request.company_website,
+            target_titles=request.target_titles,
+            max_results=request.max_results,
+            find_emails=request.find_emails,
         )
-        
-        if not company.domain and not company.website:
-            # Try to discover website first
-            discovery_service = CompanyDiscoveryService()
-            discovered = discovery_service.discover_company_website(request.company_name)
-            company.domain = discovered.domain
-            company.website = discovered.website
-        
-        contact_service = ContactDiscoveryService()
-        contacts = contact_service.discover_contacts(company)
-        
-        # Discover emails
-        email_service = EmailDiscoveryService()
-        for contact in contacts:
-            email_service.discover_email(contact)
-            db.insert_contact(contact)
-            db.insert_audit_event(actor=AUDIT_ACTOR, action="contact_discover", entity_type="contact", entity_id=contact.id or contact.full_name, metadata={"company": contact.company_name})
-        
         return ContactSearchResponse(
             success=True,
             company_name=request.company_name,
-            contacts_found=len(contacts),
-            contacts=[c.model_dump() for c in contacts]
+            contacts_found=len(outcome.contacts),
+            contacts=[c.model_dump() for c in outcome.contacts],
+            warnings=outcome.warnings,
         )
-    
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Contact discovery error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Contact discovery failed")
 
 
 @router.get("/contacts")

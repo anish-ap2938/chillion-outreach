@@ -59,6 +59,9 @@ class Settings(BaseSettings):
     # Frontend URL (for OAuth redirects)
     frontend_url: str = "http://localhost:3000"
 
+    # Prospeo people search
+    prospeo_api_key: Optional[str] = None
+
 
 settings = Settings()
 

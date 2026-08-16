@@ -59,7 +59,6 @@ class CompanyEnrichmentProvider(ABC):
     Implement this interface to integrate with:
     - Clearbit
     - ZoomInfo
-    - Apollo.io
     - LinkedIn Sales Navigator
     - D&B Hoovers
     """
@@ -130,7 +129,7 @@ class DummyEnrichmentProvider(CompanyEnrichmentProvider):
     """
     Dummy enrichment provider that echoes input data.
     
-    Replace with actual enrichment API (Clearbit, Apollo, etc.) for production.
+    Replace with an actual company enrichment API (Clearbit, etc.) for production.
     """
     
     def enrich_company(self, company_name: str, domain: Optional[str] = None) -> Dict[str, Any]:

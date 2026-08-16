@@ -556,6 +556,9 @@ export interface ContactDiscoveryRequest {
   company_name: string;
   company_domain?: string;
   company_website?: string;
+  target_titles: string[];
+  max_results?: number;
+  find_emails?: boolean;
 }
 
 export interface DiscoveredContact {
@@ -568,9 +571,14 @@ export interface DiscoveredContact {
   title: string;
   email?: string;
   email_status?: string;
+  email_confidence?: number;
   linkedin_url?: string;
   seniority_level?: string;
+  source?: string;
   source_url?: string;
+  provider?: string;
+  provider_id?: string;
+  email_source?: string;
   discovered_at?: string;
 }
 
@@ -579,6 +587,7 @@ export interface ContactDiscoveryResponse {
   company_name: string;
   contacts_found: number;
   contacts: DiscoveredContact[];
+  warnings?: string[];
 }
 
 export interface EmailGenerateRequest {

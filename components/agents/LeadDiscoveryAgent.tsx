@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect } from "react";
 import {
   discoverCompanies,
   discoverContacts,
@@ -17,7 +17,53 @@ import { Table, TableHead, TableBody, TableRow, TableHeaderCell, TableCell } fro
 import { Badge } from "@/components/ui/Badge";
 import { useToast } from "@/components/ui/Toaster";
 import { Button } from "@/components/ui/Button";
-import { Input } from "@/components/ui/Input";
+
+function parseTargetTitles(raw: string): string[] {
+  const parts = raw.split(/[\n,]+/).map((part) => part.trim()).filter(Boolean);
+  const seen = new Set<string>();
+  const titles: string[] = [];
+  for (const part of parts) {
+    const key = part.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    titles.push(part);
+  }
+  return titles;
+}
+
+function formatEmailStatus(contact: DiscoveredContact): { label: string; variant: "neutral" | "info" | "warning" | "success" } {
+  const status = (contact.email_status || "").toLowerCase();
+  if (status === "pattern_guess") {
+    return { label: "Pattern Guess", variant: "warning" };
+  }
+  if (status === "verified" && contact.email) {
+    return { label: "Verified", variant: "success" };
+  }
+  if (status === "likely" && contact.email) {
+    return { label: "Likely", variant: "info" };
+  }
+  if (!contact.email || status === "not_found") {
+    return { label: "Not Found", variant: "neutral" };
+  }
+  return { label: "Unverified", variant: "info" };
+}
+
+function formatContactSource(contact: DiscoveredContact): string {
+  const raw = (contact.provider || contact.source || "").toLowerCase();
+  if (raw === "prospeo") {
+    return "Prospeo";
+  }
+  if (raw === "company_website" || raw === "website") {
+    return "Company Website";
+  }
+  if (raw === "linkedin") {
+    return (contact.provider || "").toLowerCase() === "prospeo" ? "Prospeo" : "Company Website";
+  }
+  if (!raw) {
+    return "Company Website";
+  }
+  return contact.provider || contact.source || "Company Website";
+}
 
 export default function LeadDiscoveryAgent() {
   const [activeTab, setActiveTab] = useState<"companies" | "contacts" | "email">("companies");
@@ -468,10 +514,14 @@ function ContactsTab({
 }) {
   const [companyName, setCompanyName] = useState("");
   const [companyDomain, setCompanyDomain] = useState("");
+  const [targetTitles, setTargetTitles] = useState("");
+  const [maxResults, setMaxResults] = useState(10);
+  const [findEmails, setFindEmails] = useState(true);
   const [loading, setLoading] = useState(false);
   const [results, setResults] = useState<DiscoveredContact[]>([]);
   const [savedContacts, setSavedContacts] = useState<DiscoveredContact[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [warnings, setWarnings] = useState<string[]>([]);
   const [showSaved, setShowSaved] = useState(false);
   const [hasEmailFilter, setHasEmailFilter] = useState<string>("any");
   const [page, setPage] = useState(1);
@@ -504,18 +554,33 @@ function ContactsTab({
   };
 
   const handleDiscover = async () => {
-    setLoading(true);
     setError(null);
+    setWarnings([]);
+    const name = companyName.trim();
+    if (!name) {
+      setError("Please enter a company name");
+      return;
+    }
+    const titles = parseTargetTitles(targetTitles);
+    if (titles.length === 0) {
+      setError("Please enter at least one target job title");
+      return;
+    }
+    if (!Number.isInteger(maxResults) || maxResults < 1 || maxResults > 50) {
+      setError("Max results must be a number between 1 and 50");
+      return;
+    }
+    setLoading(true);
     try {
-      if (!companyName.trim()) {
-        setError("Please enter a company name");
-        return;
-      }
       const response = await discoverContacts({
-        company_name: companyName.trim(),
+        company_name: name,
         company_domain: companyDomain.trim() || undefined,
+        target_titles: titles,
+        max_results: maxResults,
+        find_emails: findEmails,
       });
       setResults(response.contacts || []);
+      setWarnings(response.warnings || []);
       onRefresh();
       toast({ title: "Contacts found", description: `${response.contacts?.length || 0} contacts`, variant: "success" });
     } catch (e: any) {
@@ -528,9 +593,9 @@ function ContactsTab({
 
   const exportContacts = (contacts: DiscoveredContact[]) => {
     const csv = [
-      "Name,Title,Company,Email,LinkedIn,Seniority",
+      "Name,Title,Company,Email,Email Status,LinkedIn,Source,Seniority",
       ...contacts.map(c => 
-        `"${c.full_name}","${c.title}","${c.company_name}","${c.email || ''}","${c.linkedin_url || ''}","${c.seniority_level || ''}"`
+        `"${c.full_name}","${c.title}","${c.company_name}","${c.email || ''}","${formatEmailStatus(c).label}","${c.linkedin_url || ''}","${formatContactSource(c)}","${c.seniority_level || ''}"`
       )
     ].join("\n");
     const blob = new Blob([csv], { type: "text/csv" });
@@ -588,18 +653,53 @@ function ContactsTab({
                     value={companyName}
                     onChange={(e) => setCompanyName(e.target.value)}
                     className="w-full rounded-xl bg-zinc-800/50 border border-zinc-700 px-4 py-3 text-white placeholder-zinc-500 focus:border-purple-500 focus:outline-none transition"
-                    placeholder="Acme Corporation"
+                    placeholder="Microsoft"
                   />
                 </div>
                 <div>
-                  <label className="text-sm font-medium text-zinc-400 mb-2 block">Company Domain (optional)</label>
+                  <label className="text-sm font-medium text-zinc-400 mb-2 block">Company Domain</label>
                   <input
                     value={companyDomain}
                     onChange={(e) => setCompanyDomain(e.target.value)}
                     className="w-full rounded-xl bg-zinc-800/50 border border-zinc-700 px-4 py-3 text-white placeholder-zinc-500 focus:border-purple-500 focus:outline-none transition"
-                    placeholder="acme.com"
+                    placeholder="microsoft.com"
                   />
                 </div>
+              </div>
+
+              <div>
+                <label className="text-sm font-medium text-zinc-400 mb-2 block">Target Job Titles *</label>
+                <textarea
+                  value={targetTitles}
+                  onChange={(e) => setTargetTitles(e.target.value)}
+                  rows={4}
+                  className="w-full rounded-xl bg-zinc-800/50 border border-zinc-700 px-4 py-3 text-white placeholder-zinc-500 focus:border-purple-500 focus:outline-none transition"
+                  placeholder={"Head of IT\nIT Director\nVP Infrastructure\nSecurity Director"}
+                />
+                <p className="text-xs text-zinc-500 mt-2">One per line, or comma-separated.</p>
+              </div>
+
+              <div className="grid grid-cols-2 gap-4 items-end">
+                <div>
+                  <label className="text-sm font-medium text-zinc-400 mb-2 block">Max Results</label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={50}
+                    value={maxResults}
+                    onChange={(e) => setMaxResults(Number(e.target.value))}
+                    className="w-full rounded-xl bg-zinc-800/50 border border-zinc-700 px-4 py-3 text-white placeholder-zinc-500 focus:border-purple-500 focus:outline-none transition"
+                  />
+                </div>
+                <label className="flex items-center gap-2 text-sm text-zinc-400 pb-3">
+                  <input
+                    type="checkbox"
+                    checked={findEmails}
+                    onChange={(e) => setFindEmails(e.target.checked)}
+                    className="rounded border-zinc-600"
+                  />
+                  Find Work Emails
+                </label>
               </div>
 
             <Button
@@ -607,13 +707,21 @@ function ContactsTab({
               disabled={loading}
               className="w-full bg-gradient-to-r from-purple-500 to-pink-500 px-6 py-4 font-medium text-white shadow-lg shadow-purple-500/25 hover:shadow-purple-500/40 transition disabled:opacity-50"
             >
-              {loading ? "🔍 Searching..." : "👤 Discover IT & Engineering Contacts"}
+              {loading ? "🔍 Searching..." : "Find Contacts"}
             </Button>
             </div>
           </div>
 
           {error && (
             <div className="p-4 bg-red-500/10 border border-red-500/20 rounded-xl text-red-400">{error}</div>
+          )}
+
+          {warnings.length > 0 && (
+            <div className="p-4 bg-amber-500/10 border border-amber-500/20 rounded-xl text-amber-200 text-sm space-y-1">
+              {warnings.map((warning) => (
+                <div key={warning}>{warning}</div>
+              ))}
+            </div>
           )}
 
           {results.length > 0 && (
@@ -631,8 +739,8 @@ function ContactsTab({
           {!loading && results.length === 0 && !error && (
             <div className="text-center py-16">
               <div className="text-6xl mb-4">👤</div>
-              <h3 className="text-xl font-semibold text-zinc-300">Find Finance Decision Makers</h3>
-              <p className="text-zinc-500 mt-2">Enter a company name to discover CFOs, VPs, and finance leaders</p>
+              <h3 className="text-xl font-semibold text-zinc-300">Find Target Contacts</h3>
+              <p className="text-zinc-500 mt-2">Enter a company and job titles to discover matching decision makers</p>
             </div>
           )}
         </>
@@ -753,7 +861,9 @@ function ContactResultsTable({
             <TableHeaderCell>Title</TableHeaderCell>
             <TableHeaderCell>Company</TableHeaderCell>
             <TableHeaderCell>Email</TableHeaderCell>
+            <TableHeaderCell>Email Status</TableHeaderCell>
             <TableHeaderCell>LinkedIn</TableHeaderCell>
+            <TableHeaderCell>Source</TableHeaderCell>
           </TableRow>
         </TableHead>
         <TableBody>
@@ -775,12 +885,19 @@ function ContactResultsTable({
                 )}
               </TableCell>
               <TableCell>
+                {(() => {
+                  const status = formatEmailStatus(c);
+                  return <Badge variant={status.variant}>{status.label}</Badge>;
+                })()}
+              </TableCell>
+              <TableCell>
                 {c.linkedin_url ? (
                   <a href={c.linkedin_url} target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:underline">
                     View
                   </a>
                 ) : "-"}
               </TableCell>
+              <TableCell className="text-zinc-400 text-xs">{formatContactSource(c)}</TableCell>
             </TableRow>
           ))}
         </TableBody>

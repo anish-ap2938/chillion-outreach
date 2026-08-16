@@ -395,15 +395,31 @@ class EmailDiscoveryService:
         Returns:
             Contact with email field populated
         """
-        # If email already exists, just validate it
+        # Never overwrite a provider-verified or likely professional email
+        # with local regex results or a pattern guess.
+        existing_status = (contact.email_status or "").lower()
+        if contact.email and (
+            existing_status in ("verified", "likely")
+            or (contact.provider or "") == "prospeo"
+        ):
+            if not getattr(contact, "email_source", None):
+                contact.email_source = "prospeo"
+            return contact
+
+        # If email already exists, run local format checks only.
+        # Local "valid" is syntax/domain-list — not mailbox verification.
         if contact.email:
             result = self.validator.validate_email(contact.email)
-            contact.email_status = result.get('status', 'unverified')
+            status = result.get('status', 'unverified')
+            if status in ('valid',):
+                status = 'unverified'
+            contact.email_status = status
             return contact
         
         # Need first name, last name, and domain
         if not contact.first_name or not contact.last_name or not contact.company_domain:
             self.logger.warning(f"Incomplete data for email discovery: {contact.full_name}")
+            contact.email_status = "not_found"
             return contact
         
         # Generate and validate candidates
@@ -413,10 +429,17 @@ class EmailDiscoveryService:
             contact.company_domain
         )
         
-        # Set best guess as contact email
+        # Pattern generator output is a guess, never a verified mailbox.
         if discovery.best_guess:
             contact.email = discovery.best_guess
             contact.email_status = "pattern_guess"
+            contact.email_source = "pattern_guess"
+            matching = next((c for c in discovery.candidates if c.email == discovery.best_guess), None)
+            if matching:
+                contact.email_confidence = matching.confidence
+        else:
+            contact.email_status = "not_found"
+            contact.email_source = "none"
         
         return contact
     

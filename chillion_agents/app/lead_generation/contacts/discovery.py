@@ -17,6 +17,8 @@ from bs4 import BeautifulSoup
 
 from ..models import FinanceContact, Company, ContactSource
 from ..config import get_config, CompanyTargetConfig
+from ..providers.base import PeopleSearchProvider
+from .titles import matches_target_title
 
 logger = logging.getLogger(__name__)
 
@@ -59,15 +61,23 @@ class ContactDiscoveryService:
         '/executives',
     ]
     
-    def __init__(self, config: Optional[CompanyTargetConfig] = None):
+    def __init__(
+        self,
+        config: Optional[CompanyTargetConfig] = None,
+        people_provider: Optional[PeopleSearchProvider] = None,
+    ):
         """
         Initialize the contact discovery service.
         
         Args:
             config: Company targeting configuration
+            people_provider: Optional PeopleSearchProvider. When set, people
+                lookup is delegated to that provider. Website scraping
+                remains the default when no provider is injected.
         """
         self.config = config or get_config().company
         self.target_titles = [t.lower() for t in self.config.target_titles]
+        self.people_provider = people_provider
         
         self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
         
@@ -85,19 +95,31 @@ class ContactDiscoveryService:
     # Main Discovery Methods
     # =========================================================================
     
-    def discover_contacts(self, company: Company) -> List[FinanceContact]:
+    def discover_contacts(
+        self,
+        company: Company,
+        target_titles: Optional[List[str]] = None,
+        max_results: Optional[int] = None,
+        find_emails: bool = True,
+    ) -> List[FinanceContact]:
         """
-        Discover finance contacts for a company.
-        
-        Attempts to find leadership pages and parse contact information.
-        
-        Args:
-            company: Company to discover contacts for
-            
-        Returns:
-            List of FinanceContact objects
+        Discover contacts for a company.
+
+        When a people_provider is injected, lookup is delegated to it.
+        Otherwise the existing public-website scraper is used.
         """
         contacts = []
+        active_titles = self._resolve_target_titles(target_titles)
+
+        if self.people_provider:
+            provider_titles = target_titles if target_titles is not None else list(self.config.target_titles)
+            return self.people_provider.search_people(
+                company_name=company.name,
+                company_domain=company.domain,
+                target_titles=provider_titles,
+                max_results=max_results if max_results is not None else 10,
+                find_emails=find_emails,
+            )
         
         if not company.domain and not company.website:
             self.logger.warning(f"No domain/website for {company.name}, cannot discover contacts")
@@ -117,17 +139,39 @@ class ContactDiscoveryService:
         # Parse each leadership page
         for url in leadership_urls:
             try:
-                page_contacts = self.parse_leadership_page(url, company)
+                page_contacts = self.parse_leadership_page(url, company, target_titles=active_titles)
                 contacts.extend(page_contacts)
                 time.sleep(self.request_delay)
             except Exception as e:
                 self.logger.error(f"Error parsing {url}: {e}")
         
-        # Deduplicate by name
+        # Deduplicate by name, then apply the requested quota
         contacts = self._deduplicate_contacts(contacts)
+        if max_results is not None:
+            contacts = contacts[:max_results]
         
-        self.logger.info(f"Found {len(contacts)} finance contacts for {company.name}")
+        self.logger.info(f"Found {len(contacts)} contacts for {company.name}")
         return contacts
+
+    def _resolve_target_titles(self, target_titles: Optional[List[str]]) -> List[str]:
+        """
+        Normalize titles for a single request without mutating global config.
+
+        None → config defaults (already lowercased on the service).
+        Provided list → trimmed, de-duplicated, lowercased (may be empty).
+        """
+        if target_titles is None:
+            return list(self.target_titles)
+
+        seen = set()
+        resolved: List[str] = []
+        for title in target_titles:
+            cleaned = (title or "").strip().lower()
+            if not cleaned or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            resolved.append(cleaned)
+        return resolved
     
     def _find_leadership_pages(self, base_url: str) -> List[str]:
         """
@@ -234,7 +278,8 @@ class ContactDiscoveryService:
     def parse_leadership_page(
         self,
         url: str,
-        company: Optional[Company] = None
+        company: Optional[Company] = None,
+        target_titles: Optional[List[str]] = None,
     ) -> List[FinanceContact]:
         """
         Parse a leadership page for contact information.
@@ -242,11 +287,13 @@ class ContactDiscoveryService:
         Args:
             url: URL of the leadership page
             company: Optional company context
+            target_titles: Lowercased titles to match. None uses config defaults.
             
         Returns:
             List of FinanceContact objects
         """
         contacts = []
+        active_titles = self._resolve_target_titles(target_titles)
         
         try:
             response = self.session.get(url, timeout=self.timeout)
@@ -255,26 +302,24 @@ class ContactDiscoveryService:
             soup = BeautifulSoup(response.text, 'html.parser')
             
             # Try different parsing strategies
-            contacts = self._parse_structured_bios(soup, url, company)
+            contacts = self._parse_structured_bios(soup, url, company, target_titles=active_titles)
             
             if not contacts:
-                contacts = self._parse_unstructured_page(soup, url, company)
+                contacts = self._parse_unstructured_page(soup, url, company, target_titles=active_titles)
         
         except requests.exceptions.RequestException as e:
             self.logger.error(f"Request error for {url}: {e}")
         except Exception as e:
             self.logger.error(f"Parsing error for {url}: {e}")
         
-        # Filter to finance-related titles only
-        finance_contacts = [c for c in contacts if self._is_finance_title(c.title)]
-        
-        return finance_contacts
+        return [c for c in contacts if self._matches_target_title(c.title, active_titles)]
     
     def _parse_structured_bios(
         self,
         soup: BeautifulSoup,
         url: str,
-        company: Optional[Company]
+        company: Optional[Company],
+        target_titles: Optional[List[str]] = None,
     ) -> List[FinanceContact]:
         """
         Parse structured bio sections (common on leadership pages).
@@ -302,7 +347,7 @@ class ContactDiscoveryService:
         for selector in bio_selectors:
             elements = soup.select(selector)
             for element in elements:
-                contact = self._parse_bio_element(element, url, company)
+                contact = self._parse_bio_element(element, url, company, target_titles=target_titles)
                 if contact:
                     contacts.append(contact)
         
@@ -312,7 +357,8 @@ class ContactDiscoveryService:
         self,
         element: BeautifulSoup,
         url: str,
-        company: Optional[Company]
+        company: Optional[Company],
+        target_titles: Optional[List[str]] = None,
     ) -> Optional[FinanceContact]:
         """
         Parse a single bio element for contact information.
@@ -355,7 +401,7 @@ class ContactDiscoveryService:
         if not title:
             # Try to extract title from the full text
             full_text = element.get_text(strip=True)
-            title = self._extract_title_from_text(full_text)
+            title = self._extract_title_from_text(full_text, target_titles)
         
         if not title:
             return None
@@ -377,13 +423,16 @@ class ContactDiscoveryService:
             source=ContactSource.WEBSITE,
             source_url=url,
             seniority_level=self._determine_seniority(title),
+            department=None,
+            provider="company_website",
         )
     
     def _parse_unstructured_page(
         self,
         soup: BeautifulSoup,
         url: str,
-        company: Optional[Company]
+        company: Optional[Company],
+        target_titles: Optional[List[str]] = None,
     ) -> List[FinanceContact]:
         """
         Parse unstructured page content for contacts.
@@ -406,7 +455,7 @@ class ContactDiscoveryService:
             if self._is_valid_name(line):
                 # Check if next line is a title
                 if self._looks_like_title(next_line):
-                    if self._is_finance_title(next_line):
+                    if self._matches_target_title(next_line, target_titles):
                         first_name, last_name = self._parse_name(line)
                         
                         contact = FinanceContact(
@@ -419,6 +468,8 @@ class ContactDiscoveryService:
                             source=ContactSource.WEBSITE,
                             source_url=url,
                             seniority_level=self._determine_seniority(next_line),
+                            department=None,
+                            provider="company_website",
                         )
                         contacts.append(contact)
                         i += 2
@@ -475,19 +526,26 @@ class ContactDiscoveryService:
         text_lower = text.lower()
         return any(keyword in text_lower for keyword in title_keywords)
     
-    def _is_finance_title(self, title: str) -> bool:
-        """Check if title is finance-related"""
+    def _matches_target_title(self, title: str, target_titles: Optional[List[str]] = None) -> bool:
+        """
+        Case-insensitive substring match of requested titles against a scraped title.
+
+        "IT Director" matches "Senior IT Director".
+        "Head of IT" matches "Head of IT Infrastructure".
+        """
         if not title:
             return False
-        
-        title_lower = title.lower()
-        return any(target in title_lower for target in self.target_titles)
+
+        active_titles = target_titles if target_titles is not None else self.target_titles
+        return matches_target_title(title, active_titles)
     
-    def _extract_title_from_text(self, text: str) -> Optional[str]:
-        """Extract a title from a block of text"""
-        for target_title in self.config.target_titles:
-            if target_title.lower() in text.lower():
-                # Try to extract the full title phrase
+    def _extract_title_from_text(self, text: str, target_titles: Optional[List[str]] = None) -> Optional[str]:
+        """Extract a title from a block of text using the active title list."""
+        active_titles = target_titles if target_titles is not None else self.config.target_titles
+        text_lower = text.lower()
+        for target_title in active_titles:
+            target_lower = target_title.lower()
+            if target_lower in text_lower:
                 pattern = rf'({re.escape(target_title)}[^,.\n]*)'
                 match = re.search(pattern, text, re.IGNORECASE)
                 if match:

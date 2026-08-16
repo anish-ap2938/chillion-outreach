@@ -54,6 +54,7 @@ class ContactSource(str, Enum):
     PRESS_RELEASE = "press_release"
     ENRICHMENT_API = "enrichment_api"
     MANUAL = "manual"
+    PROSPEO = "prospeo"
 
 
 # =============================================================================
@@ -237,7 +238,9 @@ class FinanceContact(BaseModel):
     
     # Contact details
     email: Optional[str] = None
-    email_status: Optional[str] = None  # verified, unverified, invalid
+    email_status: Optional[str] = None  # pattern_guess, unverified, not_found (not mailbox-verified)
+    email_confidence: Optional[float] = None
+    email_source: Optional[str] = None  # prospeo, pattern_guess, none
     phone: Optional[str] = None
     
     # Social profiles
@@ -247,12 +250,14 @@ class FinanceContact(BaseModel):
     # Discovery info
     source: ContactSource = ContactSource.WEBSITE
     source_url: Optional[str] = None
+    provider: Optional[str] = None
+    provider_id: Optional[str] = None
     discovered_at: datetime = Field(default_factory=datetime.utcnow)
     
     # Additional context
     bio: Optional[str] = None
     seniority_level: Optional[str] = None  # C-Level, VP, Director, Manager
-    department: str = "Finance"
+    department: Optional[str] = None
     
     # Enrichment data
     enrichment_data: Dict[str, Any] = Field(default_factory=dict)
