@@ -20,11 +20,15 @@ export default function ActivityFeed() {
   const load = async () => {
     setLoading(true);
     try {
-      const [leadsResp, companiesResp, contactsResp] = await Promise.all([
+      const [leadsResult, companiesResult, contactsResult] = await Promise.allSettled([
         getSocialLeads({ sort_by: "discovered_at", sort_order: "desc", limit: 10, offset: 0 }),
         getDiscoveredCompanies({ sort_by: "target_score", sort_order: "desc", limit: 10, offset: 0 }),
         getDiscoveredContacts({ sort_by: "relevance_score", sort_order: "desc", limit: 10, offset: 0 }),
       ]);
+
+      const leadsResp = leadsResult.status === "fulfilled" ? leadsResult.value : { leads: [] };
+      const companiesResp = companiesResult.status === "fulfilled" ? companiesResult.value : { companies: [] };
+      const contactsResp = contactsResult.status === "fulfilled" ? contactsResult.value : { contacts: [] };
 
       const mapped: ActivityItem[] = [];
       (leadsResp.leads || []).forEach((l: SocialLead) => {
@@ -55,6 +59,9 @@ export default function ActivityFeed() {
       // Sort by time desc (fallback to original order)
       mapped.sort((a, b) => (b.time || "").localeCompare(a.time || ""));
       setItems(mapped.slice(0, 20));
+    } catch (error) {
+      console.error("Failed to load activity feed:", error);
+      setItems([]);
     } finally {
       setLoading(false);
     }

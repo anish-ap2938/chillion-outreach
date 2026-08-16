@@ -8,6 +8,7 @@ Provides normalized tables with deduplication.
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 import logging
+import json
 import sqlite3
 from pathlib import Path
 from contextlib import contextmanager
@@ -196,6 +197,10 @@ class LeadDatabase:
             
             # Lightweight migrations for existing DBs
             self._ensure_column(conn, "social_leads", "reason_for_relevance", "TEXT")
+            self._ensure_column(conn, "contacts", "provider", "TEXT")
+            self._ensure_column(conn, "contacts", "provider_id", "TEXT")
+            self._ensure_column(conn, "contacts", "email_confidence", "REAL")
+            self._ensure_column(conn, "contacts", "email_source", "TEXT")
 
             conn.commit()
             self.logger.info(f"Database initialized: {self.db_path}")
@@ -469,8 +474,9 @@ class LeadDatabase:
                         first_name, last_name, title, email, email_status, phone,
                         linkedin_url, twitter_handle, source, source_url,
                         discovered_at, bio, seniority_level, department,
-                        enrichment_data, is_decision_maker, relevance_score
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        enrichment_data, is_decision_maker, relevance_score,
+                        provider, provider_id, email_confidence, email_source
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     contact.id or f"contact_{hash(contact.full_name + contact.company_name)}",
                     contact.company_id,
@@ -494,12 +500,107 @@ class LeadDatabase:
                     json.dumps(contact.enrichment_data) if contact.enrichment_data else None,
                     1 if contact.is_decision_maker else 0,
                     contact.relevance_score,
+                    contact.provider,
+                    contact.provider_id,
+                    contact.email_confidence,
+                    getattr(contact, "email_source", None),
                 ))
                 conn.commit()
                 return True
             except sqlite3.IntegrityError:
                 self.logger.debug(f"Duplicate contact: {contact.full_name} at {contact.company_name}")
+                existing = self.get_contact_for_upsert(contact)
+                if existing:
+                    return self._update_existing_contact(existing, contact)
                 return False
+
+    def get_contact_for_upsert(self, contact: FinanceContact) -> Optional[Dict[str, Any]]:
+        """Find an existing lead contact by provider id, then name+company."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            if contact.provider_id:
+                cursor.execute(
+                    "SELECT * FROM contacts WHERE provider = ? AND provider_id = ? LIMIT 1",
+                    (contact.provider or "prospeo", contact.provider_id),
+                )
+                row = cursor.fetchone()
+                if row:
+                    return dict(row)
+            cursor.execute(
+                """
+                SELECT * FROM contacts
+                WHERE lower(company_name) = lower(?) AND lower(full_name) = lower(?)
+                LIMIT 1
+                """,
+                (contact.company_name, contact.full_name),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def upsert_contact(self, contact: FinanceContact) -> bool:
+        """
+        Insert a new lead contact or upgrade an existing one.
+
+        Never replaces a verified email with a pattern guess.
+        Never erases populated fields with None.
+        """
+        existing = self.get_contact_for_upsert(contact)
+        if not existing:
+            return self.insert_contact(contact)
+        return self._update_existing_contact(existing, contact)
+
+    def _update_existing_contact(self, existing: Dict[str, Any], contact: FinanceContact) -> bool:
+        merged = _merge_contact_row(existing, contact)
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE contacts SET
+                    company_domain = ?,
+                    first_name = ?,
+                    last_name = ?,
+                    title = ?,
+                    email = ?,
+                    email_status = ?,
+                    email_confidence = ?,
+                    email_source = ?,
+                    linkedin_url = ?,
+                    source = ?,
+                    source_url = ?,
+                    seniority_level = ?,
+                    department = ?,
+                    enrichment_data = ?,
+                    is_decision_maker = ?,
+                    relevance_score = ?,
+                    provider = ?,
+                    provider_id = ?
+                WHERE id = ?
+                """,
+                (
+                    merged["company_domain"],
+                    merged["first_name"],
+                    merged["last_name"],
+                    merged["title"],
+                    merged["email"],
+                    merged["email_status"],
+                    merged["email_confidence"],
+                    merged["email_source"],
+                    merged["linkedin_url"],
+                    merged["source"],
+                    merged["source_url"],
+                    merged["seniority_level"],
+                    merged["department"],
+                    merged["enrichment_data"],
+                    merged["is_decision_maker"],
+                    merged["relevance_score"],
+                    merged["provider"],
+                    merged["provider_id"],
+                    existing["id"],
+                ),
+            )
+            conn.commit()
+            contact.id = existing["id"]
+            return True
     
     def get_contacts(
         self,
@@ -571,4 +672,94 @@ class LeadDatabase:
             stats["contacts_with_email"] = cursor.fetchone()[0]
             
             return stats
+
+
+_EMAIL_RANK = {
+    "verified": 5,
+    "likely": 4,
+    "unverified": 3,
+    "pattern_guess": 2,
+    "invalid": 1,
+    "not_found": 0,
+}
+
+
+def _prefer_text(incoming: Any, existing: Any) -> Any:
+    if incoming is None or incoming == "":
+        return existing
+    if existing is None or existing == "":
+        return incoming
+    return incoming
+
+
+def _merge_contact_row(existing: Dict[str, Any], incoming: FinanceContact) -> Dict[str, Any]:
+    """Upgrade stored contact fields without destroying stronger data."""
+    incoming_status = (incoming.email_status or "").lower()
+    existing_status = (existing.get("email_status") or "").lower()
+    incoming_rank = _EMAIL_RANK.get(incoming_status, 0)
+    existing_rank = _EMAIL_RANK.get(existing_status, 0)
+
+    email = existing.get("email")
+    email_status = existing.get("email_status")
+    email_confidence = existing.get("email_confidence")
+    email_source = existing.get("email_source")
+    if incoming.email:
+        if incoming_rank >= existing_rank or not existing.get("email"):
+            email = incoming.email
+            email_status = incoming.email_status
+            email_confidence = incoming.email_confidence if incoming.email_confidence is not None else existing.get("email_confidence")
+            email_source = getattr(incoming, "email_source", None) or existing.get("email_source")
+
+    linkedin_url = existing.get("linkedin_url")
+    if incoming.linkedin_url and not linkedin_url:
+        linkedin_url = incoming.linkedin_url
+    elif incoming.linkedin_url and (incoming.provider or "") == "prospeo":
+        linkedin_url = incoming.linkedin_url
+
+    provider = existing.get("provider")
+    provider_id = existing.get("provider_id")
+    source = existing.get("source")
+    if (incoming.provider or "") == "prospeo":
+        provider = "prospeo"
+        source = incoming.source.value if hasattr(incoming.source, "value") else (incoming.source or source)
+        if incoming.provider_id:
+            provider_id = incoming.provider_id
+    elif not provider_id and incoming.provider_id:
+        provider = incoming.provider or provider
+        provider_id = incoming.provider_id
+
+    incoming_enrichment = incoming.enrichment_data or {}
+    existing_enrichment = existing.get("enrichment_data")
+    merged_enrichment = incoming_enrichment
+    if existing_enrichment and not incoming_enrichment:
+        merged_enrichment = existing_enrichment
+    elif incoming_enrichment:
+        try:
+            previous = json.loads(existing_enrichment) if isinstance(existing_enrichment, str) else (existing_enrichment or {})
+        except (TypeError, ValueError):
+            previous = {}
+        if isinstance(previous, dict):
+            merged_enrichment = {**previous, **incoming_enrichment}
+
+    return {
+        "company_domain": _prefer_text(incoming.company_domain, existing.get("company_domain")),
+        "first_name": _prefer_text(incoming.first_name, existing.get("first_name")),
+        "last_name": _prefer_text(incoming.last_name, existing.get("last_name")),
+        "title": _prefer_text(incoming.title, existing.get("title")),
+        "email": email,
+        "email_status": email_status,
+        "email_confidence": email_confidence,
+        "email_source": email_source,
+        "linkedin_url": linkedin_url,
+        "source": source,
+        "source_url": _prefer_text(incoming.source_url, existing.get("source_url")),
+        "seniority_level": _prefer_text(incoming.seniority_level, existing.get("seniority_level")),
+        "department": _prefer_text(incoming.department, existing.get("department")),
+        "enrichment_data": json.dumps(merged_enrichment) if isinstance(merged_enrichment, dict) else merged_enrichment,
+        "is_decision_maker": 1 if incoming.is_decision_maker else existing.get("is_decision_maker") or 0,
+        "relevance_score": incoming.relevance_score if incoming.relevance_score else existing.get("relevance_score") or 0,
+        "provider": provider,
+        "provider_id": provider_id,
+    }
+
 
